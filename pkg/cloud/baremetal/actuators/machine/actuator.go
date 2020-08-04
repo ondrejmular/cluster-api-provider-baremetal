@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"strings"
 	"time"
+	"strconv"
 
 	bmh "github.com/metal3-io/baremetal-operator/pkg/apis/metal3/v1alpha1"
 	"github.com/metal3-io/baremetal-operator/pkg/utils"
@@ -53,6 +54,9 @@ const (
 	nodeLabelsBackupAnnotation      = "remediation.metal3.io/node-labels-backup"
 	nodeAnnotationsBackupAnnotation = "remediation.metal3.io/node-annotations-backup"
 	nodeFinalizer                   = "metal3.io/capbm"
+	// TODO: add to a configmap
+	powerOffTimeout = time.Second * 180
+	powerOffRequestedOnAnnotation = "remediation.metal3.io/last-power-off-requested-on"
 )
 
 // Add RBAC rules to access cluster-api resources
@@ -731,7 +735,17 @@ func (a *Actuator) addPoweredOffForRemediationAnnotation(ctx context.Context, ma
 }
 
 //requestPowerOff adds requestPowerOffAnnotation on baremetalhost which signals BMO to power off the machine
-func (a *Actuator) requestPowerOff(ctx context.Context, baremetalhost *bmh.BareMetalHost) error {
+func (a *Actuator) requestPowerOff(ctx context.Context, machine *machinev1beta1.Machine,baremetalhost *bmh.BareMetalHost) error {
+	if machine.Annotations == nil {
+		machine.Annotations = make(map[string]string)
+	}
+	machine.Annotations[powerOffRequestedOnAnnotation] = strconv.FormatInt(time.Now().Unix(), 10)
+
+	if err := a.client.Update(ctx, machine); err != nil {
+		log.Printf("Failed to add remediation power off timestamp annotation to %s: %s", machine.Name, err.Error())
+		return err
+	}
+
 	if baremetalhost.Annotations == nil {
 		baremetalhost.Annotations = make(map[string]string)
 	}
@@ -828,11 +842,36 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 	if _, poweredOffForRemediation := machine.Annotations[poweredOffForRemediation]; !poweredOffForRemediation {
 		if !hasPowerOffRequestAnnotation(baremetalhost) {
 			log.Printf("Found an unhealthy machine, requesting power off. Machine name: %s", machine.Name)
-			return a.requestPowerOff(ctx, baremetalhost)
+			return a.requestPowerOff(ctx, machine, baremetalhost)
 		}
 
 		//hold remediation until the power off request is fulfilled
 		if baremetalhost.Status.PoweredOn {
+			powerOffOn, exist := machine.Annotations[powerOffRequestedOnAnnotation]
+			if exist {
+				timeOn, err := strconv.ParseInt(powerOffOn, 10, 64)
+				if err == nil {
+					if time.Duration((time.Now().Unix() - timeOn) * int64(time.Second)) > powerOffTimeout {
+						log.Printf("Remediation (power off) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffTimeout)
+						// TODO: powering off machine takes longer than expected
+						// check if there is a controller associated with a Machine
+						if metav1.GetControllerOf(machine) == nil {
+							log.Printf("Machine %v has no controller owner, not continuing remediation by deleting it", machine.Name)
+						} else {
+							// check wheter deletion is not already in progress
+							// handle failures
+							if err := a.client.Delete(ctx, machine); err != nil {
+								log.Printf("Unable to delete machine %v: %s", machine.Name, err.Error())
+								return err
+							}
+						}
+					}
+				} else {
+				}
+			} else {
+				log.Printf("Remediation power off reqest timestamp not found on machine %v", machine.Name)
+			}
+			// TODO: add check if poweroff takes longer than expected
 			return nil
 		}
 
