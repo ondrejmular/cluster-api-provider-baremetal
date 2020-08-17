@@ -24,7 +24,6 @@ import (
 	"math/rand"
 	"strings"
 	"time"
-	"strconv"
 
 	bmh "github.com/metal3-io/baremetal-operator/pkg/apis/metal3/v1alpha1"
 	"github.com/metal3-io/baremetal-operator/pkg/utils"
@@ -56,7 +55,11 @@ const (
 	nodeFinalizer                   = "metal3.io/capbm"
 	// TODO: add to a configmap
 	powerOffTimeout = time.Second * 180
+	powerOnTimeout = time.Second * 180
+	powerOffTimeotAnnotation = "remediation.metal3.io/power-off-timeout"
+	powerOnTimeotAnnotation = "remediation.metal3.io/power-on-timeout"
 	powerOffRequestedOnAnnotation = "remediation.metal3.io/last-power-off-requested-on"
+	powerOnRequestTimestampAnnotation = "remediation.metal3.io/last-power-on-requested-at"
 )
 
 // Add RBAC rules to access cluster-api resources
@@ -701,6 +704,8 @@ func (a *Actuator) deleteRemediationAnnotations(ctx context.Context, machine *ma
 
 	delete(machine.Annotations, poweredOffForRemediation)
 	delete(machine.Annotations, externalRemediationAnnotation)
+	delete(machine.Annotations, powerOffRequestedOnAnnotation)
+	delete(machine.Annotations, powerOnRequestTimestampAnnotation)
 
 	if err := a.client.Update(ctx, machine); err != nil {
 		log.Printf("Failed to delete annotations of Machine: %s", machine.Name)
@@ -735,11 +740,11 @@ func (a *Actuator) addPoweredOffForRemediationAnnotation(ctx context.Context, ma
 }
 
 //requestPowerOff adds requestPowerOffAnnotation on baremetalhost which signals BMO to power off the machine
-func (a *Actuator) requestPowerOff(ctx context.Context, machine *machinev1beta1.Machine,baremetalhost *bmh.BareMetalHost) error {
+func (a *Actuator) requestPowerOff(ctx context.Context, machine *machinev1beta1.Machine, baremetalhost *bmh.BareMetalHost) error {
 	if machine.Annotations == nil {
 		machine.Annotations = make(map[string]string)
 	}
-	machine.Annotations[powerOffRequestedOnAnnotation] = strconv.FormatInt(time.Now().Unix(), 10)
+	machine.Annotations[powerOffRequestedOnAnnotation] = time.Now().Format(time.RFC3339)
 
 	if err := a.client.Update(ctx, machine); err != nil {
 		log.Printf("Failed to add remediation power off timestamp annotation to %s: %s", machine.Name, err.Error())
@@ -764,8 +769,71 @@ func (a *Actuator) requestPowerOff(ctx context.Context, machine *machinev1beta1.
 	return err
 }
 
+func getTimeoutDurationFromAnnotation(baremetalhost *bmh.BareMetalHost, annotation string, defaultDuration time.Duration) time.Duration {
+	annotations := baremetalhost.ObjectMeta.GetAnnotations()
+	if annotations == nil {
+		return defaultDuration
+	}
+	durationStr, exist := annotations[annotation]
+	if !exist {
+		return defaultDuration
+	}
+	duration, err := time.ParseDuration(durationStr)
+	if err != nil {
+		log.Printf(
+			"Unable to parse duration %v from annotation %v of BMH %v",
+			durationStr,
+			annotation,
+			baremetalhost.Name,
+		)
+		return defaultDuration
+	}
+	return duration
+}
+
+func isActionTakingLong(ctx context.Context, machine *machinev1beta1.Machine, annotation string, timeout time.Duration) bool {
+	timestampStr, exist := machine.Annotations[annotation]
+	if !exist {
+		log.Printf("Annotation %v not found on machine %v", annotation, machine.Name)
+		return false
+	}
+	timeOn, err := time.Parse(time.RFC3339, timestampStr)
+	if err != nil {
+		log.Printf("Unable to parse time from annotation %v on machine %v", annotation, machine.Name)
+		return false
+	}
+	return time.Since(timeOn) > powerOffTimeout
+}
+
+func (a *Actuator) tryDeleteMachine(ctx context.Context, machine *machinev1beta1.Machine, baremetalhost *bmh.BareMetalHost) error {
+	// We don't need to chceck whether a machine is associated with a
+	// controller as we are part of machine controller.
+	if baremetalhost.Spec.ExternallyProvisioned {
+		log.Printf("Skipping remedaition of machine %v: BMH is externally provisioned", machine.Name)
+		return nil
+	}
+	if !machine.GetDeletionTimestamp().IsZero() {
+		return nil
+	}
+	err := a.client.Delete(ctx, machine)
+	if err != nil {
+		log.Printf("Unable to delete machine %v: %s", machine.Name, err.Error())
+	}
+	return err
+}
+
 //requestPowerOn removes requestPowerOffAnnotation from baremetalhost which signals BMO to power on the machine
-func (a *Actuator) requestPowerOn(ctx context.Context, baremetalhost *bmh.BareMetalHost) error {
+func (a *Actuator) requestPowerOn(ctx context.Context, machine *machinev1beta1.Machine, baremetalhost *bmh.BareMetalHost) error {
+	if machine.Annotations == nil {
+		machine.Annotations = make(map[string]string)
+	}
+	machine.Annotations[powerOnRequestTimestampAnnotation] = time.Now().Format(time.RFC3339)
+
+	if err := a.client.Update(ctx, machine); err != nil {
+		log.Printf("Failed to add remediation power on timestamp annotation to %s: %s", machine.Name, err.Error())
+		return err
+	}
+
 	if baremetalhost.Annotations == nil {
 		baremetalhost.Annotations = make(map[string]string)
 	}
@@ -847,31 +915,15 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 
 		//hold remediation until the power off request is fulfilled
 		if baremetalhost.Status.PoweredOn {
-			powerOffOn, exist := machine.Annotations[powerOffRequestedOnAnnotation]
-			if exist {
-				timeOn, err := strconv.ParseInt(powerOffOn, 10, 64)
-				if err == nil {
-					if time.Duration((time.Now().Unix() - timeOn) * int64(time.Second)) > powerOffTimeout {
-						log.Printf("Remediation (power off) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffTimeout)
-						// TODO: powering off machine takes longer than expected
-						// check if there is a controller associated with a Machine
-						if metav1.GetControllerOf(machine) == nil {
-							log.Printf("Machine %v has no controller owner, not continuing remediation by deleting it", machine.Name)
-						} else {
-							// check wheter deletion is not already in progress
-							// handle failures
-							if err := a.client.Delete(ctx, machine); err != nil {
-								log.Printf("Unable to delete machine %v: %s", machine.Name, err.Error())
-								return err
-							}
-						}
-					}
-				} else {
-				}
-			} else {
-				log.Printf("Remediation power off reqest timestamp not found on machine %v", machine.Name)
+			if isActionTakingLong(
+				ctx,
+				machine,
+				powerOffRequestedOnAnnotation,
+				getTimeoutDurationFromAnnotation(baremetalhost, powerOffTimeotAnnotation, powerOffTimeout),
+			) {
+				log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffTimeout)
+				return a.tryDeleteMachine(ctx, machine, baremetalhost)
 			}
-			// TODO: add check if poweroff takes longer than expected
 			return nil
 		}
 
@@ -905,11 +957,21 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 		// node is deleted, we can power on the host
 		log.Printf("Requesting Host %s power on for Machine %s",
 			baremetalhost.Name, machine.Name)
-		return a.requestPowerOn(ctx, baremetalhost)
+		return a.requestPowerOn(ctx, machine, baremetalhost)
 	}
 
 	//node is still not running, so we requeue
 	if node == nil {
+		if isActionTakingLong(
+			ctx,
+			machine,
+			powerOnRequestTimestampAnnotation,
+			getTimeoutDurationFromAnnotation(baremetalhost, powerOnTimeotAnnotation, powerOnTimeout),
+		) {
+			log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffTimeout)
+			return a.tryDeleteMachine(ctx, machine, baremetalhost)
+
+		}
 		return &machineapierrors.RequeueAfterError{RequeueAfter: time.Second * 5}
 	}
 
