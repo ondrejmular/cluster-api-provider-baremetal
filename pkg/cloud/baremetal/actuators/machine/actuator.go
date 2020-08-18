@@ -916,12 +916,13 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 
 		//hold remediation until the power off request is fulfilled
 		if baremetalhost.Status.PoweredOn {
+			timeout := getTimeoutDurationFromAnnotation(baremetalhost, powerOffTimeoutAnnotation, powerOffDefaultTimeout)
 			if isActionTakingLong(
 				machine,
 				powerOffRequestTimestampAnnotation,
-				getTimeoutDurationFromAnnotation(baremetalhost, powerOffTimeoutAnnotation, powerOffDefaultTimeout),
+				timeout,
 			) {
-				log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffDefaultTimeout)
+				log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, timeout)
 				return a.tryDeleteMachine(ctx, machine, baremetalhost)
 			}
 			return nil
@@ -962,12 +963,13 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 
 	//node is still not running, so we requeue
 	if node == nil {
+		timeout := getTimeoutDurationFromAnnotation(baremetalhost, powerOnTimeoutAnnotation, powerOnDefaultTimeout)
 		if isActionTakingLong(
 			machine,
 			powerOnRequestTimestampAnnotation,
-			getTimeoutDurationFromAnnotation(baremetalhost, powerOnTimeoutAnnotation, powerOnDefaultTimeout),
+			timeout,
 		) {
-			log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffDefaultTimeout)
+			log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, timeout)
 			return a.tryDeleteMachine(ctx, machine, baremetalhost)
 
 		}
