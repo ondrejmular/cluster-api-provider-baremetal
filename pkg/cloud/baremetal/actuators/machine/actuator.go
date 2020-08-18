@@ -769,6 +769,36 @@ func (a *Actuator) requestPowerOff(ctx context.Context, machine *machinev1beta1.
 	return err
 }
 
+//requestPowerOn removes requestPowerOffAnnotation from baremetalhost which signals BMO to power on the machine
+func (a *Actuator) requestPowerOn(ctx context.Context, machine *machinev1beta1.Machine, baremetalhost *bmh.BareMetalHost) error {
+	if machine.Annotations == nil {
+		machine.Annotations = make(map[string]string)
+	}
+	machine.Annotations[powerOnRequestTimestampAnnotation] = time.Now().Format(time.RFC3339)
+
+	if err := a.client.Update(ctx, machine); err != nil {
+		log.Printf("Failed to add remediation power on timestamp annotation to %s: %s", machine.Name, err.Error())
+		return err
+	}
+
+	if baremetalhost.Annotations == nil {
+		baremetalhost.Annotations = make(map[string]string)
+	}
+
+	if _, powerOffRequestExists := baremetalhost.Annotations[requestPowerOffAnnotation]; !powerOffRequestExists {
+		return &machineapierrors.RequeueAfterError{RequeueAfter: time.Second * 5}
+	}
+
+	delete(baremetalhost.Annotations, requestPowerOffAnnotation)
+
+	err := a.client.Update(ctx, baremetalhost)
+	if err != nil {
+		log.Printf("failed to power-off request annotation from %s: %s", baremetalhost.Name, err.Error())
+	}
+
+	return err
+}
+
 func getTimeoutDurationFromAnnotation(baremetalhost *bmh.BareMetalHost, annotation string, defaultDuration time.Duration) time.Duration {
 	annotations := baremetalhost.ObjectMeta.GetAnnotations()
 	if annotations == nil {
@@ -820,36 +850,6 @@ func (a *Actuator) tryDeleteMachine(ctx context.Context, machine *machinev1beta1
 	if err != nil {
 		log.Printf("Unable to delete machine %v: %s", machine.Name, err.Error())
 	}
-	return err
-}
-
-//requestPowerOn removes requestPowerOffAnnotation from baremetalhost which signals BMO to power on the machine
-func (a *Actuator) requestPowerOn(ctx context.Context, machine *machinev1beta1.Machine, baremetalhost *bmh.BareMetalHost) error {
-	if machine.Annotations == nil {
-		machine.Annotations = make(map[string]string)
-	}
-	machine.Annotations[powerOnRequestTimestampAnnotation] = time.Now().Format(time.RFC3339)
-
-	if err := a.client.Update(ctx, machine); err != nil {
-		log.Printf("Failed to add remediation power on timestamp annotation to %s: %s", machine.Name, err.Error())
-		return err
-	}
-
-	if baremetalhost.Annotations == nil {
-		baremetalhost.Annotations = make(map[string]string)
-	}
-
-	if _, powerOffRequestExists := baremetalhost.Annotations[requestPowerOffAnnotation]; !powerOffRequestExists {
-		return &machineapierrors.RequeueAfterError{RequeueAfter: time.Second * 5}
-	}
-
-	delete(baremetalhost.Annotations, requestPowerOffAnnotation)
-
-	err := a.client.Update(ctx, baremetalhost)
-	if err != nil {
-		log.Printf("failed to power-off request annotation from %s: %s", baremetalhost.Name, err.Error())
-	}
-
 	return err
 }
 
