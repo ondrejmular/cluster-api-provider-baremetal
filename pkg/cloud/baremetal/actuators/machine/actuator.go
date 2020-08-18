@@ -53,13 +53,13 @@ const (
 	nodeLabelsBackupAnnotation      = "remediation.metal3.io/node-labels-backup"
 	nodeAnnotationsBackupAnnotation = "remediation.metal3.io/node-annotations-backup"
 	nodeFinalizer                   = "metal3.io/capbm"
-	// TODO: add to a configmap
-	powerOffTimeout = time.Second * 180
-	powerOnTimeout = time.Second * 180
-	powerOffTimeotAnnotation = "remediation.metal3.io/power-off-timeout"
-	powerOnTimeotAnnotation = "remediation.metal3.io/power-on-timeout"
-	powerOffRequestedOnAnnotation = "remediation.metal3.io/last-power-off-requested-on"
-	powerOnRequestTimestampAnnotation = "remediation.metal3.io/last-power-on-requested-at"
+	// TODO: set meaningful defaults
+	powerOffDefaultTimeout             = time.Second * 180
+	powerOnDefaultTimeout              = time.Second * 180
+	powerOffTimeoutAnnotation          = "remediation.metal3.io/power-off-timeout"
+	powerOnTimeoutAnnotation           = "remediation.metal3.io/power-on-timeout"
+	powerOffRequestTimestampAnnotation = "remediation.metal3.io/last-power-off-requested-at"
+	powerOnRequestTimestampAnnotation  = "remediation.metal3.io/last-power-on-requested-at"
 )
 
 // Add RBAC rules to access cluster-api resources
@@ -704,7 +704,7 @@ func (a *Actuator) deleteRemediationAnnotations(ctx context.Context, machine *ma
 
 	delete(machine.Annotations, poweredOffForRemediation)
 	delete(machine.Annotations, externalRemediationAnnotation)
-	delete(machine.Annotations, powerOffRequestedOnAnnotation)
+	delete(machine.Annotations, powerOffRequestTimestampAnnotation)
 	delete(machine.Annotations, powerOnRequestTimestampAnnotation)
 
 	if err := a.client.Update(ctx, machine); err != nil {
@@ -744,7 +744,7 @@ func (a *Actuator) requestPowerOff(ctx context.Context, machine *machinev1beta1.
 	if machine.Annotations == nil {
 		machine.Annotations = make(map[string]string)
 	}
-	machine.Annotations[powerOffRequestedOnAnnotation] = time.Now().Format(time.RFC3339)
+	machine.Annotations[powerOffRequestTimestampAnnotation] = time.Now().Format(time.RFC3339)
 
 	if err := a.client.Update(ctx, machine); err != nil {
 		log.Printf("Failed to add remediation power off timestamp annotation to %s: %s", machine.Name, err.Error())
@@ -791,28 +791,29 @@ func getTimeoutDurationFromAnnotation(baremetalhost *bmh.BareMetalHost, annotati
 	return duration
 }
 
-func isActionTakingLong(ctx context.Context, machine *machinev1beta1.Machine, annotation string, timeout time.Duration) bool {
-	timestampStr, exist := machine.Annotations[annotation]
+func isActionTakingLong(machine *machinev1beta1.Machine, annotation string, timeout time.Duration) bool {
+	startTimeString, exist := machine.Annotations[annotation]
 	if !exist {
 		log.Printf("Annotation %v not found on machine %v", annotation, machine.Name)
 		return false
 	}
-	timeOn, err := time.Parse(time.RFC3339, timestampStr)
+	startTime, err := time.Parse(time.RFC3339, startTimeString)
 	if err != nil {
 		log.Printf("Unable to parse time from annotation %v on machine %v", annotation, machine.Name)
 		return false
 	}
-	return time.Since(timeOn) > powerOffTimeout
+	return time.Since(startTime) > timeout
 }
 
 func (a *Actuator) tryDeleteMachine(ctx context.Context, machine *machinev1beta1.Machine, baremetalhost *bmh.BareMetalHost) error {
-	// We don't need to chceck whether a machine is associated with a
-	// controller as we are part of machine controller.
+	// We don't need to check whether a machine is associated with a controller
+	// as we are part of machine controller.
 	if baremetalhost.Spec.ExternallyProvisioned {
-		log.Printf("Skipping remedaition of machine %v: BMH is externally provisioned", machine.Name)
+		log.Printf("Skipping remedaition of machine %v: BMH %v is externally provisioned", machine.Name, baremetalhost.Name)
 		return nil
 	}
 	if !machine.GetDeletionTimestamp().IsZero() {
+		// Delete already initiated
 		return nil
 	}
 	err := a.client.Delete(ctx, machine)
@@ -916,12 +917,11 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 		//hold remediation until the power off request is fulfilled
 		if baremetalhost.Status.PoweredOn {
 			if isActionTakingLong(
-				ctx,
 				machine,
-				powerOffRequestedOnAnnotation,
-				getTimeoutDurationFromAnnotation(baremetalhost, powerOffTimeotAnnotation, powerOffTimeout),
+				powerOffRequestTimestampAnnotation,
+				getTimeoutDurationFromAnnotation(baremetalhost, powerOffTimeoutAnnotation, powerOffDefaultTimeout),
 			) {
-				log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffTimeout)
+				log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffDefaultTimeout)
 				return a.tryDeleteMachine(ctx, machine, baremetalhost)
 			}
 			return nil
@@ -963,12 +963,11 @@ func (a *Actuator) remediateIfNeeded(ctx context.Context, machine *machinev1beta
 	//node is still not running, so we requeue
 	if node == nil {
 		if isActionTakingLong(
-			ctx,
 			machine,
 			powerOnRequestTimestampAnnotation,
-			getTimeoutDurationFromAnnotation(baremetalhost, powerOnTimeotAnnotation, powerOnTimeout),
+			getTimeoutDurationFromAnnotation(baremetalhost, powerOnTimeoutAnnotation, powerOnDefaultTimeout),
 		) {
-			log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffTimeout)
+			log.Printf("Remediation (power off action) of machine %v takes longer than configured timeout %v. Deleting the machine.", machine.Name, powerOffDefaultTimeout)
 			return a.tryDeleteMachine(ctx, machine, baremetalhost)
 
 		}
